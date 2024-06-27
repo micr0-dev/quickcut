@@ -1,5 +1,34 @@
+import os
 import re
 import sys
+import subprocess
+from tqdm import tqdm
+import shlex
+
+
+def generate_silence_log(input_file, log_file):
+    cmd = f"ffmpeg -i {shlex.quote(input_file)} -af silencedetect=noise=-30dB:d=0.5 -f null - 2> {log_file}"
+
+    total_duration_cmd = f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {shlex.quote(input_file)}"
+    total_duration = float(
+        subprocess.check_output(total_duration_cmd, shell=True).strip()
+    )
+
+    with tqdm(
+        total=total_duration, desc="Generating silence log", unit="s", ncols=100
+    ) as pbar:
+        process = subprocess.Popen(
+            cmd, shell=True, stderr=subprocess.PIPE, universal_newlines=True
+        )
+        for line in process.stderr:
+            if "time=" in line:
+                time = re.search(r"time=(\d+:\d+:\d+.\d+)", line)
+                if time:
+                    h, m, s = map(float, time.group(1).split(":"))
+                    current_time = h * 3600 + m * 60 + s
+                    pbar.n = current_time
+                    pbar.refresh()
+        process.wait()
 
 
 def parse_silence_log(log_file):
@@ -48,19 +77,56 @@ def generate_ffmpeg_trim_command(input_file, intervals, output_file):
     return cmd
 
 
+def summarize_silence(input_file, intervals):
+    total_duration_cmd = f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {shlex.quote(input_file)}"
+    total_duration = float(
+        subprocess.check_output(total_duration_cmd, shell=True).strip()
+    )
+
+    silent_duration = sum(end - start for start, end in intervals if end is not None)
+
+    print(f"\n#### Summary: ####")
+    print(f"Total silence detected: {total_duration - silent_duration:.2f} seconds")
+    print(f"Video duration after removing silence: {silent_duration:.2f} seconds")
+    print(
+        "Percentage of video to be removed: {:.2f}%".format(
+            (1 - silent_duration / total_duration) * 100
+        )
+    )
+
+    print("\nFFmpeg execution:\n\n")
+
+
 if __name__ == "__main__":
-    if len(sys.argv) < 4:
-        print("Usage: python trim_silence.py silence.log input.mp4 output.mp4")
+    if len(sys.argv) < 2:
+        print("Usage: python trim_silence.py input.mp4")
         sys.exit(1)
 
-    log_file = sys.argv[1]
-    input_file = sys.argv[2]
-    output_file = sys.argv[3]
+    input_file = sys.argv[1]
+    output_file = input_file.split(".")[-2] + "NoSilence." + input_file.split(".")[-1]
+    log_file = "silence.log"
 
-    intervals = parse_silence_log(log_file)
-    if not intervals:
-        sys.exit(1)
+    try:
+        # Generate silence log using FFmpeg
+        generate_silence_log(input_file, log_file)
 
-    cmd = generate_ffmpeg_trim_command(input_file, intervals, output_file)
-    print("Generated FFmpeg command:")
-    print(cmd)
+        # Parse the silence log to get intervals
+        intervals = parse_silence_log(log_file)
+        if not intervals:
+            sys.exit(1)
+
+        # Summarize silence detection
+        summarize_silence(input_file, intervals)
+
+        # Generate the FFmpeg command
+        cmd = generate_ffmpeg_trim_command(input_file, intervals, output_file)
+        print("Generated FFmpeg command:")
+        print(cmd)
+
+        # Execute the FFmpeg command
+        subprocess.run(cmd, shell=True, check=True)
+
+    finally:
+        # Clean up: remove the silence log file
+        if os.path.exists(log_file):
+            os.remove(log_file)
