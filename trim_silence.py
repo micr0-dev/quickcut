@@ -6,6 +6,18 @@ from tqdm import tqdm
 import shlex
 
 
+def is_nvenc_available():
+    try:
+        cmd = ["ffmpeg", "-encoders"]
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        return "h264_nvenc" in result.stdout
+    except Exception as e:
+        print(f"Error checking NVENC availability: {e}")
+        return False
+
+
 def generate_silence_log(input_file, log_file):
     cmd = f"ffmpeg -i {shlex.quote(input_file)} -af silencedetect=noise=-30dB:d=0.5 -f null - 2> {log_file}"
 
@@ -63,7 +75,7 @@ def parse_silence_log(log_file):
     return intervals
 
 
-def generate_ffmpeg_trim_command(input_file, intervals, output_file):
+def save_filter_complex_to_file(intervals, filter_file):
     filter_complex = ""
     for i, (start, end) in enumerate(intervals):
         end = f":end={end}" if end is not None else ""
@@ -73,7 +85,12 @@ def generate_ffmpeg_trim_command(input_file, intervals, output_file):
     all_concat = "".join([f"[v{i}][a{i}]" for i in range(len(intervals))])
     filter_complex += f"{all_concat}concat=n={len(intervals)}:v=1:a=1[v][a]"
 
-    cmd = f'ffmpeg -i {input_file} -filter_complex "{filter_complex}" -map "[v]" -map "[a]" {output_file}'
+    with open(filter_file, "w") as f:
+        f.write(filter_complex)
+
+
+def generate_ffmpeg_trim_command(input_file, filter_file, output_file):
+    cmd = f"ffmpeg -i {shlex.quote(input_file)} -filter_complex_script {shlex.quote(filter_file)} -map [v] -map [a] {shlex.quote(output_file)}"
     return cmd
 
 
@@ -105,6 +122,7 @@ if __name__ == "__main__":
     input_file = sys.argv[1]
     output_file = input_file.split(".")[-2] + "NoSilence." + input_file.split(".")[-1]
     log_file = "silence.log"
+    filter_file = "filter_complex.txt"
 
     try:
         # Generate silence log using FFmpeg
@@ -118,8 +136,11 @@ if __name__ == "__main__":
         # Summarize silence detection
         summarize_silence(input_file, intervals)
 
+        # Save filter complex to a file
+        save_filter_complex_to_file(intervals, filter_file)
+
         # Generate the FFmpeg command
-        cmd = generate_ffmpeg_trim_command(input_file, intervals, output_file)
+        cmd = generate_ffmpeg_trim_command(input_file, filter_file, output_file)
         print("Generated FFmpeg command:")
         print(cmd)
 
@@ -127,6 +148,8 @@ if __name__ == "__main__":
         subprocess.run(cmd, shell=True, check=True)
 
     finally:
-        # Clean up: remove the silence log file
+        # Clean up: remove the silence log file and filter complex file
         if os.path.exists(log_file):
             os.remove(log_file)
+        if os.path.exists(filter_file):
+            os.remove(filter_file)
