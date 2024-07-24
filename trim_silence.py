@@ -18,10 +18,32 @@ def is_nvenc_available():
         return False
 
 
-def generate_silence_log(input_file, log_file):
-    cmd = f"ffmpeg -i {shlex.quote(input_file)} -af silencedetect=noise=-30dB:d=0.5 -f null - 2> {log_file}"
+def split_video(input_file, chunk_length):
+    split_files = []
+    cmd = (
+        f"ffmpeg -i {shlex.quote(input_file)} -c copy -map 0 "
+        f"-segment_time {chunk_length} -f segment -reset_timestamps 1 "
+        f"temp_chunk_%03d.mkv"
+    )
+    subprocess.run(cmd, shell=True, check=True)
 
-    total_duration_cmd = f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {shlex.quote(input_file)}"
+    for file in sorted(os.listdir()):
+        if file.startswith("temp_chunk_") and file.endswith(".mkv"):
+            split_files.append(file)
+
+    if not split_files:
+        print("Failed to split video.")
+        return None
+
+    return split_files
+
+
+def generate_silence_log(input_file, log_file):
+    input_file_quoted = shlex.quote(input_file)
+    log_file_quoted = shlex.quote(log_file)
+    cmd = f"ffmpeg -i {input_file_quoted} -af silencedetect=noise=-30dB:d=0.5 -f null - 2> {log_file_quoted}"
+
+    total_duration_cmd = f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {input_file_quoted}"
     total_duration = float(
         subprocess.check_output(total_duration_cmd, shell=True).strip()
     )
@@ -89,29 +111,40 @@ def save_filter_complex_to_file(intervals, filter_file):
         f.write(filter_complex)
 
 
-def generate_ffmpeg_trim_command(input_file, filter_file, output_file):
-    cmd = f"ffmpeg -i {shlex.quote(input_file)} -filter_complex_script {shlex.quote(filter_file)} -map [v] -map [a] {shlex.quote(output_file)}"
+def generate_ffmpeg_trim_command(input_file, filter_file, output_file, use_nvenc):
+    input_file_quoted = shlex.quote(input_file)
+    filter_file_quoted = shlex.quote(filter_file)
+    output_file_quoted = shlex.quote(output_file)
+    nvenc_opts = "-c:v h264_nvenc" if use_nvenc else ""
+    cmd = f"ffmpeg -i {input_file_quoted} -filter_complex_script {filter_file_quoted} {nvenc_opts} -map [v] -map [a] {output_file_quoted}"
     return cmd
 
 
 def summarize_silence(input_file, intervals):
-    total_duration_cmd = f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {shlex.quote(input_file)}"
+    input_file_quoted = shlex.quote(input_file)
+    total_duration_cmd = f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {input_file_quoted}"
     total_duration = float(
         subprocess.check_output(total_duration_cmd, shell=True).strip()
     )
 
     silent_duration = sum(end - start for start, end in intervals if end is not None)
 
-    print(f"\n#### Summary: ####")
-    print(f"Total silence detected: {total_duration - silent_duration:.2f} seconds")
-    print(f"Video duration after removing silence: {silent_duration:.2f} seconds")
+    print(f"\nSummary:")
+    print(f"Total video duration: {total_duration:.2f} seconds")
+    print(f"Total silence detected: {silent_duration:.2f} seconds")
     print(
-        "Percentage of video to be removed: {:.2f}%".format(
-            (1 - silent_duration / total_duration) * 100
-        )
+        f"Video duration after removing silence: {total_duration - silent_duration:.2f} seconds"
     )
 
-    print("\nFFmpeg execution:\n\n")
+
+def concatenate_videos(video_files, output_file):
+    with open("concat_list.txt", "w") as f:
+        for video in video_files:
+            f.write(f"file '{os.path.abspath(video)}'\n")
+
+    cmd = f"ffmpeg -f concat -safe 0 -i concat_list.txt -c copy {shlex.quote(output_file)}"
+    subprocess.run(cmd, shell=True, check=True)
+    os.remove("concat_list.txt")
 
 
 if __name__ == "__main__":
@@ -121,35 +154,91 @@ if __name__ == "__main__":
 
     input_file = sys.argv[1]
     output_file = input_file.split(".")[-2] + "NoSilence." + input_file.split(".")[-1]
+    chunk_length = int(sys.argv[2]) if len(sys.argv) > 3 else 600  # Default 10 minutes
+
     log_file = "silence.log"
     filter_file = "filter_complex.txt"
 
     try:
-        # Generate silence log using FFmpeg
-        generate_silence_log(input_file, log_file)
+        # Check for NVENC availability
+        use_nvenc = is_nvenc_available()
+        print(f"Using NVENC: {use_nvenc}")
 
-        # Parse the silence log to get intervals
-        intervals = parse_silence_log(log_file)
-        if not intervals:
+        # Split video into chunks
+        split_files = split_video(input_file, chunk_length)
+        if not split_files:
             sys.exit(1)
 
-        # Summarize silence detection
-        summarize_silence(input_file, intervals)
+        processed_files = []
 
-        # Save filter complex to a file
-        save_filter_complex_to_file(intervals, filter_file)
+        for chunk in split_files:
+            print(f"Processing chunk: {chunk}")
 
-        # Generate the FFmpeg command
-        cmd = generate_ffmpeg_trim_command(input_file, filter_file, output_file)
-        print("Generated FFmpeg command:")
-        print(cmd)
+            # Generate silence log for the chunk
+            generate_silence_log(chunk, log_file)
 
-        # Execute the FFmpeg command
-        subprocess.run(cmd, shell=True, check=True)
+            # Parse the silence log to get intervals for the chunk
+            intervals = parse_silence_log(log_file)
+            if not intervals:
+                # If no silence detected, add the chunk to processed_files as-is
+                processed_files.append(chunk)
+                continue
 
+            # Summarize silence detection
+            summarize_silence(chunk, intervals)
+
+            # Save filter complex to a file
+            save_filter_complex_to_file(intervals, filter_file)
+
+            # Generate the FFmpeg command for the chunk
+            output_chunk = f"processed_{chunk}"
+            cmd = generate_ffmpeg_trim_command(
+                chunk, filter_file, output_chunk, use_nvenc
+            )
+            print("Generated FFmpeg command:")
+            print(cmd)
+
+            # Execute the FFmpeg command for the chunk
+            subprocess.run(cmd, shell=True, check=True)
+            processed_files.append(output_chunk)
+
+            # Clean up: remove the log files and filter complex file for the chunk
+            if os.path.exists(log_file):
+                os.remove(log_file)
+            if os.path.exists(filter_file):
+                os.remove(filter_file)
+
+        # Concatenate processed chunks
+        concatenate_videos(processed_files, output_file)
+
+        # Print summary comparing original and processed video
+        print("\n\nOriginal video:")
+        total_duration = float(
+            subprocess.check_output(
+                f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {shlex.quote(input_file)}",
+                shell=True,
+            ).strip()
+        )
+        print(f"Duration: {total_duration:.2f} seconds")
+
+        print("\nProcessed video:")
+        processed_duration = float(
+            subprocess.check_output(
+                f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {shlex.quote(output_file)}",
+                shell=True,
+            ).strip()
+        )
+        print(f"Duration: {processed_duration:.2f} seconds")
+
+        print(
+            f"\nRemoved { total_duration - processed_duration:.2f} seconds of silence"
+        )
+        print(
+            f"That's a {((total_duration - processed_duration) / total_duration) * 100:.2f}% reduction in video duration"
+        )
+        print(f"Processed video saved as: {output_file}")
     finally:
-        # Clean up: remove the silence log file and filter complex file
-        if os.path.exists(log_file):
-            os.remove(log_file)
-        if os.path.exists(filter_file):
-            os.remove(filter_file)
+        # Clean up: remove temporary chunk files
+        for file in split_files + processed_files:
+            if os.path.exists(file) and "temp_chunk_" in file:
+                os.remove(file)
