@@ -154,7 +154,7 @@ if __name__ == "__main__":
 
     input_file = sys.argv[1]
     output_file = input_file.split(".")[-2] + "NoSilence." + input_file.split(".")[-1]
-    chunk_length = int(sys.argv[2]) if len(sys.argv) > 3 else 600  # Default 10 minutes
+    chunk_length = int(sys.argv[2]) if len(sys.argv) > 3 else 300  # Default 10 minutes
 
     log_file = "silence.log"
     filter_file = "filter_complex.txt"
